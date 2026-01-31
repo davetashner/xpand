@@ -1,250 +1,198 @@
-# ADR-005: Merge/Preserve Semantics for Updates
+# ADR-005: xpand Scope - Initial Generation Only
 
 **Status:** Proposed
 **Date:** 2026-01-31
+**Supersedes:** Original merge/preserve semantics discussion
 
 ## Context
 
-When xpand runs against resources that already exist, it must decide what to do. The key constraint: **other tools (security scanners, cost optimizers, SRE) may have modified fields, and those changes should not be lost.**
+Originally, we planned for xpand to handle both initial generation AND updates with complex merge/preserve semantics. After reviewing:
 
-This is central to the Configuration as Data philosophy—configuration is a shared substrate that multiple tools write to.
+1. Brian Grant's ["Configuration needs an API"](https://itnext.io/configuration-needs-an-api-b36f08b92551)
+2. The [ConfigHub SDK function model](https://github.com/confighub/sdk/blob/main/function/README.md)
 
-Example scenario:
-1. Developer runs `xpand create` → generates Lambda with memory=128
-2. FinOps runs cost optimizer → changes memory to 192 (right-sized)
-3. Developer runs `xpand create` again (maybe changing timeout)
-4. **Question**: What happens to memory?
-   - If xpand overwrites: memory reverts to 128 (FinOps change lost)
-   - If xpand preserves: memory stays 192 (correct)
+We recognize a cleaner separation of concerns that aligns with the Configuration as Data philosophy.
+
+## The Key Insight
+
+> "Functions and other tools built around the API can be single purpose or multi-purpose, but they do not need to be monolithic in the way that configuration generators do."
+> — Brian Grant
+
+**Configuration has an API.** Once resources exist, modifications should use API-based tools, not re-generation.
 
 ## Decision Drivers
 
-- **Multi-source safety**: Don't overwrite changes from other tools
-- **Predictability**: Users should understand what xpand will change
-- **Conflict detection**: Alert when xpand and another tool disagree
-- **Auditability**: Track who owns which fields
-- **Simplicity**: Don't make the update flow overly complex
+- **Separation of concerns**: Generation is different from mutation
+- **Composability**: ConfigHub functions compose; generators don't
+- **Reduced complexity**: No merge logic in xpand
+- **Ecosystem alignment**: Use ConfigHub's existing function infrastructure
+- **Multi-source support**: Functions enable Security/FinOps/SRE to modify without understanding xpand
 
-## Field Ownership Model
+## Considered Options
 
-We propose a field ownership model where each field has an "owner":
+### Option A: xpand Handles Everything (Original Design)
 
-- **xpand-owned**: Fields that xpand sets from pattern logic (e.g., region derived from --region flag)
-- **external-owned**: Fields set by other tools (security tags, cost optimizations)
-- **user-owned**: Fields explicitly set by user via --set flag
-
-### Ownership Tracking Options
-
-#### Option A: Annotations
-
-Track ownership in Kubernetes annotations:
-
-```yaml
-metadata:
-  annotations:
-    xpand.io/field-owners: |
-      spec.forProvider.region: xpand
-      spec.forProvider.memorySize: finops-optimizer
-      spec.forProvider.tags.security-reviewed: security-scanner
-```
-
-**Pros:**
-- Visible in the resource
-- Standard Kubernetes pattern
-- Tools can read ownership
-
-**Cons:**
-- Annotation can get large
-- Must parse on every operation
-- Synchronization challenges
-
-#### Option B: Sidecar File
-
-Track ownership in a separate file alongside resources:
-
-```yaml
-# .xpand-ownership.yaml
-resources:
-  - name: api-handler
-    kind: Function
-    fields:
-      spec.forProvider.region: xpand
-      spec.forProvider.memorySize: external
-      spec.forProvider.tags.security-reviewed: external
-```
-
-**Pros:**
-- Doesn't clutter resources
-- Easy to parse
-- Can track history
-
-**Cons:**
-- Extra file to manage
-- Can get out of sync
-- Not visible in ConfigHub/GitOps
-
-#### Option C: Diff-Based Detection
-
-Don't track ownership explicitly. Instead, compare current state to what xpand would generate:
-
-1. Read existing resources
-2. Generate what xpand would produce
-3. Diff to find fields that differ
-4. Preserve differing fields (assume external ownership)
-
-**Pros:**
-- No ownership tracking needed
-- Works with existing resources
-- Simple mental model
-
-**Cons:**
-- Can't distinguish "user changed" from "external changed"
-- False positives if pattern defaults change
-- Less precise conflict detection
-
-## Merge Strategies
-
-### Strategy 1: Preserve External (Recommended)
-
-xpand only updates fields it "owns". Fields that differ from xpand's output are assumed external and preserved.
-
-```
-Existing:   memorySize: 192  (set by finops)
-xpand wants: memorySize: 128  (pattern default)
-Result:     memorySize: 192  (preserved)
-```
-
-### Strategy 2: Warn on Conflict
-
-Same as Strategy 1, but warn when preservation happens:
-
-```
-Warning: Preserving external changes to api-handler:
-  - spec.forProvider.memorySize: 192 (xpand default: 128)
-  Use --overwrite to use xpand defaults instead.
-```
-
-### Strategy 3: Explicit Ownership Flags
-
-User explicitly declares what to preserve:
+xpand handles both initial creation and updates with merge/preserve logic.
 
 ```bash
-xpand create ... --preserve spec.forProvider.memorySize --preserve spec.forProvider.tags
+# Initial
+xpand create serverless-event-app --env dev ...
+
+# Update (xpand must merge)
+xpand create serverless-event-app --env dev --set timeout=30
 ```
 
 **Pros:**
-- Maximum control
-- No magic
+- Single tool for everything
+- Familiar "re-run to update" pattern
 
 **Cons:**
-- Verbose
-- Easy to forget fields
+- Complex merge/preserve logic
+- Must track field ownership
+- Duplicates ConfigHub function capabilities
+- Monolithic, not composable
 
-## Conflict Scenarios
+### Option B: xpand for Initial, Functions for Updates (Recommended)
 
-### Scenario A: External Modified, User Wants Different
+xpand only generates initial resources. All subsequent changes use ConfigHub functions.
 
+```bash
+# Initial generation (xpand)
+xpand create serverless-event-app --env dev --account 123...
+
+# Subsequent changes (ConfigHub functions)
+cub fn invoke set-lambda-memory --unit api-handler --value 256
+cub fn invoke set-env-var --name LOG_LEVEL --value debug
+cub fn invoke set-tag --key cost-center --value platform
 ```
-Existing:    memorySize: 192 (finops)
-User wants:  memorySize: 256 (via --set)
+
+**Pros:**
+- Clean separation of concerns
+- Leverages ConfigHub's composable function model
+- No merge complexity in xpand
+- Functions work for any tool (Security, FinOps, SRE)
+- Aligns with "configuration as API" philosophy
+
+**Cons:**
+- Two tools to learn (xpand + ConfigHub functions)
+- Initial setup requires both
+
+### Option C: xpand Generates Function Sequences
+
+xpand outputs a sequence of ConfigHub function invocations instead of raw YAML.
+
+```bash
+xpand create serverless-event-app --env dev --account 123... --output functions
 ```
 
-**Resolution**: User's explicit --set takes precedence.
+Output:
+```yaml
+functions:
+  - name: create-bucket
+    args: {name: "messagewall-dev-123...", region: "us-east-1"}
+  - name: create-table
+    args: {name: "messagewall-dev-123...", region: "us-east-1"}
+  # ... etc
+```
 
-### Scenario B: Pattern Changed, External Modified
+**Pros:**
+- Everything is functions
+- Unified model
 
-Pattern v1 default: 128MB
-Pattern v2 default: 256MB
-External set: 192MB
-
-**Resolution**: Preserve external (192MB). User must explicitly --set to override.
-
-### Scenario C: Conflicting External Tools
-
-Security set: tag.security-level=high
-Cost optimizer: tag.security-level=medium
-
-**Resolution**: This is outside xpand's scope. Last writer wins in Git. xpand preserves whatever exists.
+**Cons:**
+- Requires "create-X" functions for every resource type
+- More complex than just generating YAML
+- Initial creation doesn't benefit from composability
 
 ## Decision
 
-We recommend:
+**Option B: xpand for initial generation, ConfigHub functions for all updates.**
 
-1. **Option C (Diff-Based Detection)** for ownership tracking—simplest implementation, works with existing resources
-2. **Strategy 2 (Warn on Conflict)** for merge behavior—preserve external changes but inform user
-3. **User override via --set** takes precedence over both xpand defaults and external changes
-4. **--overwrite flag** to forcibly regenerate everything (dangerous, requires confirmation)
+### xpand's Scope
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| Generate resources from scratch | Update existing resources |
+| Apply pattern defaults | Merge with existing values |
+| Validate inputs | Track field ownership |
+| Output explicit YAML | Handle multi-source conflicts |
+
+### Update Workflow
+
+After initial `xpand create`:
+
+```bash
+# Developer changes timeout
+cub fn invoke set-lambda-timeout --selector "kind=Function" --value 30
+
+# Security adds compliance tag
+cub fn invoke set-tag --key security-reviewed --value "2026-01-31"
+
+# FinOps right-sizes memory
+cub fn invoke set-lambda-memory --unit api-handler --value 192
+
+# SRE adds debug env var during incident
+cub fn invoke set-env-var --name DEBUG_MODE --value true
+```
+
+All changes:
+- Use the configuration API (paths, selectors)
+- Are composable with other functions
+- Don't require understanding xpand patterns
+- Are tracked in ConfigHub revision history
+
+### What About Re-Running xpand?
+
+If a developer runs `xpand create` again on existing resources:
+
+1. **Default behavior**: Error with message directing to ConfigHub functions
+2. **`--force` flag**: Regenerate everything (destructive, warns loudly)
+3. **`--diff` flag**: Show what would be different without applying
+
+```bash
+$ xpand create serverless-event-app --env dev ...
+Error: Resources already exist in output directory.
+
+To modify existing resources, use ConfigHub functions:
+  cub fn invoke set-lambda-memory --unit api-handler --value 256
+  cub fn invoke set-env-var --name KEY --value value
+
+To see what would change: xpand create ... --diff
+To force regeneration (DESTRUCTIVE): xpand create ... --force
+```
 
 ## Consequences
 
 ### Positive
-- External changes are preserved by default
-- Users are informed when preservation happens
-- Works with existing resources without migration
-- --set provides explicit override
+- xpand becomes much simpler (no merge logic)
+- Clear mental model: xpand = bootstrap, functions = modify
+- Leverages ConfigHub's mature function infrastructure
+- Multi-source modifications work naturally
+- Field ownership tracking not needed in xpand
 
 ### Negative
-- May preserve unintentional changes
-- Pattern default changes don't propagate automatically
-- Warning messages may be noisy initially
+- Users must learn ConfigHub functions for updates
+- Two tools instead of one
+- Initial documentation must explain the split
 
 ### Neutral
-- Users must use --set or --overwrite for intentional changes
-- Responsibility for field values is distributed
+- Aligns with broader ConfigHub ecosystem direction
+- May influence how other generation tools integrate
 
 ## Implementation Notes
 
-### Diff-Based Merge Algorithm
+### Remove from xpand backlog
+- EPIC-4 (Merge/Preserve System) - no longer needed
+- ISSUE-4.1, 4.2, 4.3 - delete
 
-```go
-func (e *Expander) MergeWithExisting(pattern string, inputs Inputs, existing Resource) (Resource, []Conflict) {
-    // Generate what xpand would produce from scratch
-    fresh := e.Expand(pattern, inputs)
+### Add to xpand
+- Clear error when resources exist
+- `--diff` flag to compare
+- `--force` flag (with confirmation) for regeneration
+- Documentation pointing to ConfigHub functions
 
-    // Start with existing as base
-    result := existing.DeepCopy()
-
-    var conflicts []Conflict
-
-    // For each field xpand wants to set
-    for path, freshValue := range fresh.FlattenFields() {
-        existingValue := existing.GetField(path)
-
-        // If field was explicitly set via --set, always use new value
-        if inputs.ExplicitlySet(path) {
-            result.SetField(path, inputs.Get(path))
-            continue
-        }
-
-        // If existing matches fresh, no conflict
-        if existingValue == freshValue {
-            continue
-        }
-
-        // Existing differs from fresh—preserve existing, record conflict
-        conflicts = append(conflicts, Conflict{
-            Path:          path,
-            ExistingValue: existingValue,
-            XpandValue:    freshValue,
-        })
-        // result already has existingValue, so nothing to do
-    }
-
-    return result, conflicts
-}
-```
-
-### Warning Output
-
-```
-$ xpand create serverless-event-app --env dev --account 123...
-
-Preserving external changes (use --overwrite to discard):
-  api-handler:
-    - spec.forProvider.memorySize: 192 (xpand default: 128)
-    - spec.forProvider.tags.cost-center: platform (not in pattern)
-  snapshot-writer:
-    - spec.forProvider.timeout: 45 (xpand default: 10)
-
-Created 17 resources in 4 files.
-```
+### Consider for ConfigHub
+- Ensure functions exist for common Crossplane resource modifications
+- `set-lambda-memory`, `set-lambda-timeout` for Lambda Functions
+- `set-dynamodb-capacity` for DynamoDB Tables
+- Generic `set-string-path`, `set-int-path` as fallbacks

@@ -39,12 +39,12 @@ xpand implements the "Configuration as Data" philosophy: configuration is explic
 │  │   Pattern    │  │    Input     │  │  Expansion   │  │   Output     │    │
 │  │   Loader     │──│  Validator   │──│   Engine     │──│  Formatter   │    │
 │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘    │
-│         │                                    │                              │
-│         ▼                                    ▼                              │
-│  ┌──────────────┐                    ┌──────────────┐                      │
-│  │   Pattern    │                    │    Merge     │                      │
-│  │   Catalog    │                    │    Engine    │                      │
-│  └──────────────┘                    └──────────────┘                      │
+│         │                                                                    │
+│         ▼                                                                    │
+│  ┌──────────────┐                                                           │
+│  │   Pattern    │                                                           │
+│  │   Catalog    │                                                           │
+│  └──────────────┘                                                           │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
@@ -118,17 +118,17 @@ Responsibilities:
 - Ensure deterministic output
 - Handle environment variants (see [ADR-003](decisions/003-environment-variants.md))
 
-### Merge Engine
+### Existing Resource Detection
 
-Handles updates when resources already exist.
+Detects when resources already exist and directs users to ConfigHub functions.
 
 Responsibilities:
-- Compare existing vs. generated
-- Preserve external changes
-- Detect conflicts
-- Apply user overrides (--set)
+- Check if output directory contains resources
+- Provide helpful error message with ConfigHub function examples
+- Support `--diff` flag to show what would change
+- Support `--force` flag for complete regeneration
 
-See [ADR-005](decisions/005-merge-preserve.md) for details.
+See [ADR-005](decisions/005-merge-preserve.md) for scope boundaries.
 
 ### Output Formatter
 
@@ -157,18 +157,28 @@ Responsibilities:
 
 ### Update Flow (Existing Resources)
 
+xpand only handles initial generation. When resources exist, xpand directs users to ConfigHub functions:
+
 ```
 1. User: xpand create serverless-event-app --env dev --account 123...
-2. CLI parses flags into Inputs struct
-3. Pattern Loader fetches pattern definition
-4. Input Validator checks inputs
-5. xpand reads existing resources from disk
-6. Expansion Engine generates fresh resources
-7. Merge Engine compares fresh vs. existing
-8. Merge Engine preserves external changes, reports conflicts
-9. Output Formatter writes merged resources
-10. User commits to Git
+2. CLI detects existing resources in output directory
+3. xpand errors with helpful message:
+
+   Error: Resources already exist in output directory.
+
+   To modify existing resources, use ConfigHub functions:
+     cub fn invoke set-lambda-memory --unit api-handler --value 256
+     cub fn invoke set-env-var --name KEY --value value
+
+   To see what would change: xpand create ... --diff
+   To force regeneration (DESTRUCTIVE): xpand create ... --force
+
+4. User uses ConfigHub functions for modifications
+5. ConfigHub functions commit changes to Git
+6. CI pipeline validates and syncs
 ```
+
+See [ADR-005](decisions/005-merge-preserve.md) for the rationale behind this approach.
 
 ## Pattern Structure
 
@@ -198,11 +208,11 @@ A pattern definition contains:
 │   - FunctionURL (Lambda)                        │
 │   - Rule + Target (EventBridge)                 │
 │   - ...                                         │
-├─────────────────────────────────────────────────┤
-│ Field Ownership                                  │
-│   - Which fields are owned by xpand            │
-│   - Which fields are safe for external changes │
 └─────────────────────────────────────────────────┘
+
+Note: Field ownership tracking is NOT needed in xpand. Once resources exist,
+all modifications are handled by ConfigHub functions which use the
+configuration API (paths, selectors) directly.
 ```
 
 See [ADR-002](decisions/002-pattern-format.md) for format details.
